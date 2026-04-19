@@ -1,0 +1,4 @@
+bin/
+data/state.json
+*.exe
+*.tmp
