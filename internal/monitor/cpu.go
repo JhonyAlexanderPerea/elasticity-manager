@@ -81,10 +81,17 @@ func (m *CPUMonitor) poll() {
 		cpu, err := m.measureCPU(inst.SSHPort)
 		if err != nil {
 			log.Printf("[monitor] %s: %v", inst.Name, err)
+			m.clearLatest(inst.Name)
 			continue
 		}
 		m.record(inst.Name, cpu)
 	}
+}
+
+func (m *CPUMonitor) clearLatest(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.latest, name)
 }
 
 // measureCPU connects via SSH to the VM on the given host-forwarded port
