@@ -7,6 +7,7 @@ import "sync"
 type AutoScalerConfig struct {
 	UpperThreshold   float64 `json:"upper_threshold"`   // % to trigger scale-out
 	LowerThreshold   float64 `json:"lower_threshold"`   // % to trigger scale-in
+	PeakThreshold    float64 `json:"peak_threshold"`    // % peak on one VM to trigger scale-out
 	SampleInterval   int     `json:"sample_interval"`   // seconds between CPU polls
 	EvaluationWindow int     `json:"evaluation_window"` // seconds to average CPU over
 	MaxInstances     int     `json:"max_instances"`

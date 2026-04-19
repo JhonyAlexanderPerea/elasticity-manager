@@ -1,11 +1,17 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"elasticity-manager/internal/autoscaler"
@@ -56,6 +62,7 @@ func NewRouter(
 
 	// Events
 	mux.HandleFunc("GET /api/events", h.listEvents)
+	mux.HandleFunc("GET /api/events/stream", h.streamEvents)
 
 	// HAProxy raw config
 	mux.HandleFunc("GET /api/haproxy/config", h.haproxyConfig)
@@ -83,6 +90,89 @@ type handlers struct {
 	vm     *vm.Manager
 	mon    *monitor.CPUMonitor
 	scaler *autoscaler.AutoScaler
+
+	wrkMu     sync.Mutex
+	wrkCancel context.CancelFunc
+	wrkMode   string
+}
+
+func (h *handlers) startLocalWrk(threads, connections, duration int, targetURL, targetLabel string) {
+	h.wrkMu.Lock()
+	if h.wrkCancel != nil {
+		h.wrkCancel()
+		h.wrkCancel = nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	h.wrkCancel = cancel
+	h.wrkMode = targetLabel
+	h.wrkMu.Unlock()
+
+	go h.runLocalWrk(ctx, threads, connections, duration, targetURL, targetLabel)
+}
+
+func (h *handlers) runLocalWrk(ctx context.Context, threads, connections, duration int, targetURL, targetLabel string) {
+	// Fallback local: impacta un objetivo HTTP desde el host local.
+	target := targetURL
+	deadline := time.Now().Add(time.Duration(duration) * time.Second)
+	workers := connections
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > 2000 {
+		workers = 2000
+	}
+
+	transport := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: 2 * time.Second}).DialContext,
+		MaxIdleConns:        workers,
+		MaxIdleConnsPerHost: workers,
+		MaxConnsPerHost:     workers,
+		IdleConnTimeout:     30 * time.Second,
+	}
+	client := &http.Client{Timeout: 3 * time.Second, Transport: transport}
+
+	var okCount atomic.Int64
+	var failCount atomic.Int64
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if time.Now().After(deadline) {
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				resp, err := client.Get(target)
+				if err != nil {
+					failCount.Add(1)
+					continue
+				}
+				_, _ = io.Copy(io.Discard, resp.Body)
+				_ = resp.Body.Close()
+				if resp.StatusCode >= 200 && resp.StatusCode < 500 {
+					okCount.Add(1)
+				} else {
+					failCount.Add(1)
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	h.wrkMu.Lock()
+	h.wrkCancel = nil
+	h.wrkMode = ""
+	h.wrkMu.Unlock()
+
+	h.scaler.AddEvent(autoscaler.EventInfo,
+		fmt.Sprintf("wrk %s finalizado: t=%d c=%d d=%ds target=%s ok=%d fail=%d", targetLabel, threads, connections, duration, target, okCount.Load(), failCount.Load()))
 }
 
 // ── UI ──────────────────────────────────────────────────────────────────────
@@ -102,9 +192,27 @@ func (h *handlers) putConfig(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, err.Error())
 		return
 	}
+	if cfg.MinInstances < 2 {
+		badRequest(w, "min_instances debe ser >= 2 para garantizar balanceo entre VMs")
+		return
+	}
+	if cfg.MaxInstances < 2 {
+		badRequest(w, "max_instances debe ser >= 2")
+		return
+	}
+	if cfg.MinInstances > cfg.MaxInstances {
+		badRequest(w, "min_instances no puede ser mayor que max_instances")
+		return
+	}
 	if cfg.LowerThreshold >= cfg.UpperThreshold {
 		badRequest(w, "lower_threshold debe ser menor que upper_threshold")
 		return
+	}
+	if cfg.PeakThreshold <= 0 {
+		cfg.PeakThreshold = 90
+	}
+	if cfg.PeakThreshold > 100 {
+		cfg.PeakThreshold = 100
 	}
 	if cfg.SampleInterval < 1 {
 		cfg.SampleInterval = 5
@@ -113,8 +221,9 @@ func (h *handlers) putConfig(w http.ResponseWriter, r *http.Request) {
 		cfg.EvaluationWindow = cfg.SampleInterval * 6
 	}
 	h.store.SetConfig(cfg)
+	go h.scaler.EnsureMinInstances(cfg.MinInstances)
 	h.scaler.AddEvent(autoscaler.EventInfo,
-		fmt.Sprintf("Configuración actualizada: upper=%.0f%% lower=%.0f%%", cfg.UpperThreshold, cfg.LowerThreshold))
+		fmt.Sprintf("Configuración actualizada: upper=%.0f%% lower=%.0f%% peak=%.0f%%", cfg.UpperThreshold, cfg.LowerThreshold, cfg.PeakThreshold))
 	respond(w, http.StatusOK, cfg)
 }
 
@@ -130,6 +239,8 @@ type statusResponse struct {
 	ScalerOn      bool               `json:"scaler_enabled"`
 	Uptime        string             `json:"uptime"`
 	ServerTime    string             `json:"server_time"`
+	StartUnix     int64              `json:"start_unix"`
+	StartUnixNano int64              `json:"start_unix_nano"`
 }
 
 func (h *handlers) getStatus(w http.ResponseWriter, r *http.Request) {
@@ -137,15 +248,28 @@ func (h *handlers) getStatus(w http.ResponseWriter, r *http.Request) {
 	managed := h.vm.ListInstances()
 	runningCount := 0
 	instanceNames := make([]string, 0, len(managed))
-	latest := h.mon.Latest()
+	rawLatest := h.mon.Latest()
+	latest := make(map[string]float64, len(managed))
+	knownManaged := make(map[string]struct{}, len(managed))
 	for _, inst := range managed {
-		instanceNames = append(instanceNames, inst.Name)
+		knownManaged[inst.Name] = struct{}{}
 		if inst.Status == vm.StatusRunning {
+			instanceNames = append(instanceNames, inst.Name)
 			runningCount++
+			if cpu, ok := rawLatest[inst.Name]; ok {
+				latest[inst.Name] = cpu
+			} else {
+				latest[inst.Name] = 0
+			}
 		}
-		if _, ok := latest[inst.Name]; !ok {
-			latest[inst.Name] = 0
+	}
+	for name, cpu := range rawLatest {
+		if _, ok := knownManaged[name]; ok {
+			continue
 		}
+		// Keep simulated/injected series visible in dashboard gauges.
+		latest[name] = cpu
+		instanceNames = append(instanceNames, name)
 	}
 	respond(w, http.StatusOK, statusResponse{
 		Instances:     runningCount,
@@ -156,6 +280,8 @@ func (h *handlers) getStatus(w http.ResponseWriter, r *http.Request) {
 		ScalerOn:      h.scaler.IsEnabled(),
 		Uptime:        time.Since(startTime).Round(time.Second).String(),
 		ServerTime:    time.Now().Format(time.RFC3339),
+		StartUnix:     startTime.Unix(),
+		StartUnixNano: startTime.UnixNano(),
 	})
 }
 
@@ -204,6 +330,10 @@ func (h *handlers) updateBackend(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) deleteBackend(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
+	if name == "app-backend" {
+		badRequest(w, "app-backend es obligatorio para enrutar tráfico por HAProxy")
+		return
+	}
 	if err := h.hap.DeleteBackend(name); err != nil {
 		serverError(w, err.Error())
 		return
@@ -257,11 +387,29 @@ func (h *handlers) updateServer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) removeServer(w http.ResponseWriter, r *http.Request) {
-	if err := h.hap.RemoveServer(r.PathValue("name"), r.PathValue("server")); err != nil {
+	backendName := r.PathValue("name")
+	serverName := r.PathValue("server")
+	if backendName == "app-backend" {
+		b, ok := h.hap.GetBackend(backendName)
+		if ok {
+			appVMCount := 0
+			for _, srv := range b.Servers {
+				if strings.HasPrefix(srv.Name, "app-vm-") {
+					appVMCount++
+				}
+			}
+			if strings.HasPrefix(serverName, "app-vm-") && appVMCount <= 2 {
+				badRequest(w, "no se puede remover: app-backend debe mantener al menos 2 app-vm para balanceo")
+				return
+			}
+		}
+	}
+
+	if err := h.hap.RemoveServer(backendName, serverName); err != nil {
 		serverError(w, err.Error())
 		return
 	}
-	respond(w, http.StatusOK, map[string]string{"removed": r.PathValue("server")})
+	respond(w, http.StatusOK, map[string]string{"removed": serverName})
 }
 
 // ── VMs ───────────────────────────────────────────────────────────────────────
@@ -280,6 +428,100 @@ func (h *handlers) listVMs(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) listEvents(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusOK, h.scaler.Events())
 }
+
+func (h *handlers) streamEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		serverError(w, "streaming no soportado")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	writeEvent := func(ev autoscaler.Event) bool {
+		payload, err := json.Marshal(ev)
+		if err != nil {
+			return true
+		}
+		if _, err := fmt.Fprintf(w, "event: log\ndata: %s\n\n", payload); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	events := h.scaler.Events()
+	maxInit := 40
+	end := maxInit - 1
+	if end >= len(events) {
+		end = len(events) - 1
+	}
+	for i := end; i >= 0; i-- {
+		if !writeEvent(events[i]) {
+			return
+		}
+	}
+
+	lastKey := ""
+	if len(events) > 0 {
+		last := events[0]
+		lastKey = fmt.Sprintf("%s|%s|%s", last.Timestamp.Format(time.RFC3339Nano), last.Kind, last.Message)
+	}
+
+	ticker := time.NewTicker(350 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			curr := h.scaler.Events()
+			if len(curr) == 0 {
+				if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+				continue
+			}
+
+			newest := curr[0]
+			newestKey := fmt.Sprintf("%s|%s|%s", newest.Timestamp.Format(time.RFC3339Nano), newest.Kind, newest.Message)
+			if newestKey == lastKey {
+				if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+				continue
+			}
+
+			idxLast := -1
+			for i, ev := range curr {
+				k := fmt.Sprintf("%s|%s|%s", ev.Timestamp.Format(time.RFC3339Nano), ev.Kind, ev.Message)
+				if k == lastKey {
+					idxLast = i
+					break
+				}
+			}
+
+			limit := len(curr)
+			if idxLast >= 0 {
+				limit = idxLast
+			}
+			for i := limit - 1; i >= 0; i-- {
+				if !writeEvent(curr[i]) {
+					return
+				}
+			}
+			lastKey = newestKey
+		}
+	}
+}
+
+
 
 // ── HAProxy config ────────────────────────────────────────────────────────────
 func (h *handlers) haproxyConfig(w http.ResponseWriter, r *http.Request) {
@@ -305,49 +547,47 @@ func (h *handlers) simulate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if body.UseSSH && body.InstanceName != "" {
-		cpuLoad := int(body.CPUPercent)
-		if cpuLoad <= 0 {
-			cpuLoad = 100
-		}
-		if cpuLoad > 100 {
-			cpuLoad = 100
-		}
-		duration := body.Duration
-		if duration < 1 {
-			duration = 60
-		}
-		checkCmd := "command -v stress-ng >/dev/null 2>&1"
-		if _, err := h.vm.RunCommand(body.InstanceName, checkCmd); err != nil {
-			serverError(w, fmt.Sprintf("stress-ng no está instalado o no está en PATH en %s: %v", body.InstanceName, err))
-			return
-		}
-		cmd := fmt.Sprintf("setsid sh -c 'exec stress-ng --cpu 0 --cpu-load %d --timeout %ds >/dev/null 2>&1 < /dev/null' >/dev/null 2>&1 < /dev/null &", cpuLoad, duration)
-		if _, err := h.vm.RunCommand(body.InstanceName, cmd); err != nil {
-			serverError(w, fmt.Sprintf("stress-ng SSH: %v", err))
-			return
-		}
-		h.scaler.AddEvent(autoscaler.EventInfo,
-			fmt.Sprintf("stress-ng iniciado en %s: load=%d%% por %ds", body.InstanceName, cpuLoad, duration))
-	} else {
-		// Simulated injection (no SSH needed – great for demos)
-		name := body.InstanceName
-		if name == "" {
-			name = "simulated-vm"
-		}
-		duration := body.Duration
-		if duration < 1 {
-			duration = 60
-		}
-		h.mon.StartSimulatedLoad(name, body.CPUPercent, time.Duration(duration)*time.Second)
-		go func() {
-			time.Sleep(time.Duration(duration) * time.Second)
-			h.scaler.AddEvent(autoscaler.EventInfo,
-				fmt.Sprintf("CPU simulada finalizada para '%s'", name))
-		}()
-		h.scaler.AddEvent(autoscaler.EventInfo,
-			fmt.Sprintf("CPU simulada %.0f%% inyectada en '%s' (%ds)", body.CPUPercent, name, duration))
+		badRequest(w, "instance_name no aplica para stress-ng via SSH global. Déjalo vacío para ejecutar en todas las app-vm running")
+		return
 	}
-	respond(w, http.StatusOK, map[string]string{"status": "simulación iniciada"})
+	if !body.UseSSH {
+		badRequest(w, "simulación inyectada deshabilitada: usa stress-ng via SSH global")
+		return
+	}
+
+	cpuLoad := int(body.CPUPercent)
+	if cpuLoad <= 0 {
+		cpuLoad = 100
+	}
+	if cpuLoad > 100 {
+		cpuLoad = 100
+	}
+	duration := body.Duration
+	if duration < 1 {
+		duration = 60
+	}
+
+	targets := h.runningAppVMNames()
+	if len(targets) == 0 {
+		serverError(w, "no hay app-vm running para ejecutar stress-ng")
+		return
+	}
+
+	targetsCopy := append([]string(nil), targets...)
+	h.scaler.AddEvent(autoscaler.EventInfo,
+		fmt.Sprintf("Iniciando stress-ng en app-vm running (%d nodos): load=%d%% por %ds", len(targetsCopy), cpuLoad, duration))
+
+	go func(targets []string, load, secs int) {
+		mode, err := h.startStressOnTargets(targets, load, secs)
+		if err != nil {
+			h.scaler.AddEvent(autoscaler.EventWarning, fmt.Sprintf("stress-ng SSH: %v", err))
+			return
+		}
+		h.scaler.AddEvent(autoscaler.EventInfo,
+			fmt.Sprintf("stress-ng iniciado en app-vm running (%d nodos): load=%d%% por %ds (%s)", len(targets), load, secs, mode))
+	}(targetsCopy, cpuLoad, duration)
+
+	respond(w, http.StatusOK, map[string]string{"status": "simulación en inicio"})
 }
 
 func (h *handlers) cancelSimulate(w http.ResponseWriter, r *http.Request) {
@@ -360,30 +600,30 @@ func (h *handlers) cancelSimulate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if body.UseSSH {
-		if body.InstanceName == "" {
-			badRequest(w, "instance_name es requerido para cancelar stress-ng vía SSH")
-			return
-		}
-		cmd := "pkill -f stress-ng || true"
-		if _, err := h.vm.RunCommand(body.InstanceName, cmd); err != nil {
-			serverError(w, fmt.Sprintf("cancelar stress-ng SSH: %v", err))
-			return
-		}
-		h.scaler.AddEvent(autoscaler.EventInfo,
-			fmt.Sprintf("stress-ng cancelado en %s", body.InstanceName))
-		respond(w, http.StatusOK, map[string]string{"status": "stress-ng cancelado"})
+	if !body.UseSSH {
+		badRequest(w, "simulación inyectada deshabilitada: usa cancelación stress-ng via SSH global")
 		return
 	}
 
-	name := body.InstanceName
-	if name == "" {
-		name = "simulated-vm"
+	if body.InstanceName != "" {
+		badRequest(w, "instance_name no aplica para cancelar stress-ng via SSH global. Déjalo vacío")
+		return
 	}
-	h.mon.RemoveInstanceData(name)
+
+	targets := h.runningAppVMNames()
+	if len(targets) == 0 {
+		respond(w, http.StatusOK, map[string]string{"status": "sin app-vm running para cancelar"})
+		return
+	}
+
+	cmd := "pkill -x stress-ng >/dev/null 2>&1 || true; pkill -f '^python3(\\s+.*)?\\s+/tmp/em_cpu_burn.py(\\s+.*)?$' >/dev/null 2>&1 || true"
+	if err := h.runCommandOnTargets(targets, cmd); err != nil {
+		serverError(w, fmt.Sprintf("cancelar stress-ng SSH: %v", err))
+		return
+	}
 	h.scaler.AddEvent(autoscaler.EventInfo,
-		fmt.Sprintf("CPU simulada cancelada para '%s'", name))
-	respond(w, http.StatusOK, map[string]string{"status": "simulación cancelada"})
+		fmt.Sprintf("stress-ng cancelado en app-vm running (%d nodos)", len(targets)))
+	respond(w, http.StatusOK, map[string]string{"status": "stress-ng cancelado"})
 }
 
 func (h *handlers) simulateWrk(w http.ResponseWriter, r *http.Request) {
@@ -392,6 +632,7 @@ func (h *handlers) simulateWrk(w http.ResponseWriter, r *http.Request) {
 		Connections int    `json:"connections"`
 		Duration    int    `json:"duration"`
 		Path        string `json:"path"`
+		TargetVM    string `json:"target_vm"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		badRequest(w, err.Error())
@@ -424,18 +665,31 @@ func (h *handlers) simulateWrk(w http.ResponseWriter, r *http.Request) {
 
 	path := strings.TrimSpace(body.Path)
 	if path == "" {
-		path = "/"
+		path = "/heavy?ms=6000"
 	}
 	if !strings.HasPrefix(path, "/") {
 		path = "/" + path
+	}
+	if path == "/" {
+		path = "/heavy?ms=6000"
 	}
 	if strings.ContainsAny(path, " '\"`;$&|<>") {
 		badRequest(w, "path contiene caracteres no permitidos")
 		return
 	}
 
+	if err := h.ensureDemoServersForWrk(); err != nil {
+		h.scaler.AddEvent(autoscaler.EventWarning, fmt.Sprintf("No se pudo preparar servidor de carga en VMs: %v", err))
+	}
+
+	targetVM := strings.TrimSpace(body.TargetVM)
+	if targetVM != "" {
+		badRequest(w, "target_vm bypassa HAProxy y no sirve para validar balanceo. Déjalo vacío para correr wrk vía HAProxy")
+		return
+	}
+
 	if _, err := h.hap.RunCommand("command -v wrk >/dev/null 2>&1"); err != nil {
-		serverError(w, fmt.Sprintf("wrk no está instalado en la VM de HAProxy: %v", err))
+		serverError(w, fmt.Sprintf("wrk remoto no disponible en HAProxy VM (%v). Instala wrk o restablece SSH hacia HAProxy", err))
 		return
 	}
 
@@ -450,7 +704,153 @@ func (h *handlers) simulateWrk(w http.ResponseWriter, r *http.Request) {
 	respond(w, http.StatusOK, map[string]string{"status": "wrk iniciado"})
 }
 
+func (h *handlers) ensureDemoServersForWrk() error {
+	instances := h.vm.ListInstances()
+	ready := 0
+	var lastErr error
+
+	for _, inst := range instances {
+		if inst.Status != vm.StatusRunning {
+			continue
+		}
+		if !strings.HasPrefix(inst.Name, "app-vm-") {
+			continue
+		}
+
+		cmd := fmt.Sprintf("cat >/tmp/em_demo_server.py <<'PY'\nfrom http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\nfrom urllib.parse import parse_qs, urlparse\nimport hashlib\nimport time\nVMTAG='%s'\nclass H(BaseHTTPRequestHandler):\n    def log_message(self, fmt, *args):\n        return\n    def do_GET(self):\n        p = urlparse(self.path)\n        if p.path == '/health':\n            body = b'ok\\n'\n        elif p.path == '/heavy':\n            q = parse_qs(p.query)\n            ms = 6000\n            if 'ms' in q and q['ms']:\n                try:\n                    ms = max(100, min(6000, int(q['ms'][0])))\n                except ValueError:\n                    ms = 6000\n            end = time.perf_counter() + (ms / 1000.0)\n            total = 0\n            while time.perf_counter() < end:\n                hashlib.pbkdf2_hmac('sha256', b'password', b'salt', 100000)\n                total += 1\n            body = f\"served_by=%s\\nload={total}\\n\".encode()\n        else:\n            body = f\"served_by=%s\\n\".encode()\n        self.send_response(200)\n        self.send_header('Content-Type', 'text/plain; charset=utf-8')\n        self.send_header('Content-Length', str(len(body)))\n        self.end_headers()\n        self.wfile.write(body)\nThreadingHTTPServer(('0.0.0.0', 8000), H).serve_forever()\nPY\nif command -v curl >/dev/null 2>&1; then\n    if curl -fsS --max-time 2 http://127.0.0.1:8000/health >/dev/null 2>&1; then\n        exit 0\n    fi\nelif command -v wget >/dev/null 2>&1; then\n    if wget -qO- --timeout=2 http://127.0.0.1:8000/health >/dev/null 2>&1; then\n        exit 0\n    fi\nfi\nnohup python3 -u /tmp/em_demo_server.py >/tmp/em_demo_server.log 2>&1 < /dev/null &\nfor i in 1 2 3 4 5; do\n    if command -v curl >/dev/null 2>&1; then\n        if curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null 2>&1; then\n            exit 0\n        fi\n    elif command -v wget >/dev/null 2>&1; then\n        if wget -qO- --timeout=3 http://127.0.0.1:8000/health >/dev/null 2>&1; then\n            exit 0\n        fi\n    fi\n    sleep 1\ndone\nexit 1", inst.Name, inst.Name, inst.Name, inst.Name)
+
+		if _, err := h.vm.RunCommand(inst.Name, cmd); err != nil {
+			lastErr = err
+			continue
+		}
+		ready++
+	}
+
+	if ready == 0 && lastErr != nil {
+		return lastErr
+	}
+	return nil
+}
+
+func (h *handlers) runningAppVMNames() []string {
+	instances := h.vm.ListInstances()
+	names := make([]string, 0, len(instances))
+	for _, inst := range instances {
+		if inst.Status != vm.StatusRunning {
+			continue
+		}
+		if !strings.HasPrefix(inst.Name, "app-vm-") {
+			continue
+		}
+		names = append(names, inst.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (h *handlers) ensureStressNGAvailable(targets []string) error {
+	checkCmd := "command -v stress-ng >/dev/null 2>&1"
+	for _, name := range targets {
+		if _, err := h.vm.RunCommand(name, checkCmd); err != nil {
+			return fmt.Errorf("stress-ng no está instalado o no está en PATH en %s: %v", name, err)
+		}
+	}
+	return nil
+}
+
+func (h *handlers) runCommandOnTargets(targets []string, cmd string) error {
+	for _, name := range targets {
+		if _, err := h.vm.RunCommand(name, cmd); err != nil {
+			return fmt.Errorf("%s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+func (h *handlers) startStressOnTargets(targets []string, cpuLoad, duration int) (string, error) {
+	fallbackUsed := false
+	for _, name := range targets {
+		cmd := fmt.Sprintf("workers=$(nproc 2>/dev/null || echo 2)\n"+
+			"if [ -z \"$workers\" ] || [ \"$workers\" -lt 1 ]; then workers=1; fi\n"+
+			"pkill -x stress-ng >/dev/null 2>&1 || true\n"+
+			"pkill -f '^python3(\\s+.*)?\\s+/tmp/em_cpu_burn.py(\\s+.*)?$' >/dev/null 2>&1 || true\n"+
+			"if command -v stress-ng >/dev/null 2>&1; then\n"+
+			"  nohup sh -c \"exec stress-ng --cpu $workers --cpu-load %d --timeout %ds --metrics-brief\" >/tmp/stress-ng-load.log 2>&1 < /dev/null &\n"+
+			"else\n"+
+			"  echo 'stress-ng no encontrado' > /tmp/stress-ng-load.log\n"+
+			"fi\n"+
+			"sleep 1\n"+
+			"if pgrep -f '^stress-ng ' >/dev/null 2>&1; then\n"+
+			"  echo STARTED_STRESS\n"+
+			"  exit 0\n"+
+			"fi\n"+
+			"if ! command -v python3 >/dev/null 2>&1; then\n"+
+			"  echo START_FAILED_NO_PYTHON\n"+
+			"  tail -n 40 /tmp/stress-ng-load.log 2>/dev/null || true\n"+
+			"  exit 1\n"+
+			"fi\n"+
+			"cat >/tmp/em_cpu_burn.py <<'PY'\n"+
+			"import hashlib\n"+
+			"import multiprocessing\n"+
+			"import time\n"+
+			"SECONDS = %d\n"+
+			"WORKERS = 2\n"+
+			"def burn():\n"+
+			"    end = time.time() + max(1, SECONDS)\n"+
+			"    while time.time() < end:\n"+
+			"        hashlib.pbkdf2_hmac('sha256', b'password', b'salt', 60000)\n"+
+			"if __name__ == '__main__':\n"+
+			"    ps = []\n"+
+			"    for _ in range(max(1, WORKERS)):\n"+
+			"        p = multiprocessing.Process(target=burn)\n"+
+			"        p.start()\n"+
+			"        ps.append(p)\n"+
+			"    for p in ps:\n"+
+			"        p.join()\n"+
+			"PY\n"+
+			"nohup python3 -u /tmp/em_cpu_burn.py >/tmp/stress-ng-load.log 2>&1 < /dev/null &\n"+
+			"sleep 1\n"+
+			"if pgrep -f '/tmp/em_cpu_burn.py' >/dev/null 2>&1; then\n"+
+			"  echo STARTED_FALLBACK\n"+
+			"  exit 0\n"+
+			"fi\n"+
+			"echo START_FAILED\n"+
+			"tail -n 40 /tmp/stress-ng-load.log 2>/dev/null || true\n"+
+			"exit 1", cpuLoad, duration, duration)
+
+		out, err := h.vm.RunCommand(name, cmd)
+		if err != nil {
+			return "", fmt.Errorf("%s: %v (output: %s)", name, err, strings.TrimSpace(out))
+		}
+		if strings.Contains(out, "STARTED_FALLBACK") {
+			fallbackUsed = true
+			continue
+		}
+		if strings.Contains(out, "STARTED_STRESS") {
+			continue
+		}
+		return "", fmt.Errorf("%s: stress-ng no quedó activo (detalle: %s)", name, strings.TrimSpace(out))
+	}
+	if fallbackUsed {
+		return "fallback-python", nil
+	}
+	return "stress-ng", nil
+}
+
 func (h *handlers) cancelWrk(w http.ResponseWriter, r *http.Request) {
+	h.wrkMu.Lock()
+	if h.wrkCancel != nil {
+		h.wrkCancel()
+		h.wrkCancel = nil
+		mode := h.wrkMode
+		h.wrkMode = ""
+		h.wrkMu.Unlock()
+		h.scaler.AddEvent(autoscaler.EventInfo, fmt.Sprintf("wrk cancelado (%s)", mode))
+		respond(w, http.StatusOK, map[string]string{"status": "wrk cancelado"})
+		return
+	}
+	h.wrkMu.Unlock()
+
 	if _, err := h.hap.RunCommand("pkill -f '^wrk ' || true"); err != nil {
 		serverError(w, fmt.Sprintf("cancelar wrk ssh: %v", err))
 		return
@@ -462,6 +862,7 @@ func (h *handlers) cancelWrk(w http.ResponseWriter, r *http.Request) {
 // ── Scaler toggle ─────────────────────────────────────────────────────────────
 func (h *handlers) enableScaler(w http.ResponseWriter, r *http.Request) {
 	h.scaler.SetEnabled(true)
+	go h.scaler.EnsureMinInstances(h.store.GetConfig().MinInstances)
 	h.scaler.AddEvent(autoscaler.EventInfo, "Auto-scaler ACTIVADO desde el panel web")
 	respond(w, http.StatusOK, map[string]bool{"enabled": true})
 }
@@ -491,3 +892,5 @@ func badRequest(w http.ResponseWriter, msg string) {
 func serverError(w http.ResponseWriter, msg string) {
 	respond(w, http.StatusInternalServerError, map[string]string{"error": msg})
 }
+
+

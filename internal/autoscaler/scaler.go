@@ -14,6 +14,7 @@ import (
 	"elasticity-manager/internal/config"
 	"elasticity-manager/internal/haproxy"
 	"elasticity-manager/internal/monitor"
+	"elasticity-manager/internal/sshutil"
 	"elasticity-manager/internal/vm"
 )
 
@@ -49,6 +50,8 @@ type AutoScaler struct {
 	lastScaleOut time.Time
 	highSince    time.Time
 	lowSince     time.Time
+	sshUser      string
+	sshKeyPath   string
 }
 
 const scaleInCooldownAfterScaleOut = 20 * time.Second
@@ -77,6 +80,14 @@ func New(
 	}
 }
 
+// SetSSHConfig sets the SSH parameters for bootstrapping demo servers on new VMs.
+func (a *AutoScaler) SetSSHConfig(sshUser, sshKeyPath string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sshUser = sshUser
+	a.sshKeyPath = sshKeyPath
+}
+
 // Start runs the evaluation loop until ctx is cancelled.
 func (a *AutoScaler) Start(ctx context.Context) {
 	log.Println("[autoscaler] started")
@@ -93,6 +104,39 @@ func (a *AutoScaler) Start(ctx context.Context) {
 
 func (a *AutoScaler) SetEnabled(v bool) { a.mu.Lock(); a.enabled = v; a.mu.Unlock() }
 func (a *AutoScaler) IsEnabled() bool   { a.mu.Lock(); defer a.mu.Unlock(); return a.enabled }
+
+// EnsureMinInstances proactively brings capacity to at least minRequired running app VMs.
+// This is used by API actions that must guarantee balancing readiness without waiting
+// for the next periodic evaluation window.
+func (a *AutoScaler) EnsureMinInstances(minRequired int) {
+	if minRequired < 2 {
+		minRequired = 2
+	}
+	cfg := a.store.GetConfig()
+	if cfg.MaxInstances > 0 && minRequired > cfg.MaxInstances {
+		minRequired = cfg.MaxInstances
+	}
+	if minRequired < 1 {
+		minRequired = 1
+	}
+
+	maxAttempts := minRequired * 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		running := runningOnly(a.vmMgr.ListInstances())
+		if len(running) >= minRequired {
+			a.reconcileBackendServers(running)
+			return
+		}
+		a.logEvent(EventInfo, fmt.Sprintf("Forzando capacidad mínima para balanceo: %d/%d instancias activas", len(running), minRequired))
+		a.scaleOut(cfg)
+	}
+
+	running := runningOnly(a.vmMgr.ListInstances())
+	a.reconcileBackendServers(running)
+	if len(running) < minRequired {
+		a.logEvent(EventWarning, fmt.Sprintf("No se alcanzó capacidad mínima de balanceo (%d/%d activas)", len(running), minRequired))
+	}
+}
 
 // Events returns recent events newest-first (max 200).
 func (a *AutoScaler) Events() []Event {
@@ -143,17 +187,24 @@ func (a *AutoScaler) evaluate() {
 	avg := a.mon.AverageCPU(cfg.EvaluationWindow)
 	instances := a.vmMgr.ListInstances()
 	runningInstances := runningOnly(instances)
+	a.reconcileBackendServers(runningInstances)
 	n := len(runningInstances)
+	latest := a.mon.Latest()
+	peak := maxCPUForRunning(runningInstances, latest)
+	peakLimit := cfg.PeakThreshold
+	if peakLimit <= 0 {
+		peakLimit = 90
+	}
 
-	log.Printf("[autoscaler] avg=%.1f%% n=%d upper=%.0f lower=%.0f",
-		avg, n, cfg.UpperThreshold, cfg.LowerThreshold)
+	log.Printf("[autoscaler] avg=%.1f%% peak=%.1f%% n=%d upper=%.0f lower=%.0f peak_limit=%.0f",
+		avg, peak, n, cfg.UpperThreshold, cfg.LowerThreshold, peakLimit)
 
 	holdFor := time.Duration(cfg.EvaluationWindow) * time.Second
 	if holdFor < 20*time.Second {
 		holdFor = 20 * time.Second
 	}
 	now := time.Now()
-	highCondition := avg > cfg.UpperThreshold && n < cfg.MaxInstances
+	highCondition := (avg > cfg.UpperThreshold || peak > peakLimit) && n < cfg.MaxInstances
 	lowCondition := avg < cfg.LowerThreshold && n > cfg.MinInstances
 
 	if highCondition {
@@ -200,6 +251,75 @@ func (a *AutoScaler) evaluate() {
 	}
 }
 
+func (a *AutoScaler) reconcileBackendServers(running []vm.Instance) {
+	if a.hap == nil {
+		return
+	}
+
+	b, ok := a.hap.GetBackend(a.backendName)
+	if !ok {
+		if err := a.hap.CreateBackend(a.backendName, "roundrobin"); err != nil {
+			if !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+				a.logEvent(EventWarning, fmt.Sprintf("No se pudo crear backend %q para reconciliación: %v", a.backendName, err))
+				return
+			}
+		}
+		b, _ = a.hap.GetBackend(a.backendName)
+	}
+
+	runningByName := make(map[string]vm.Instance, len(running))
+	for _, inst := range running {
+		runningByName[inst.Name] = inst
+	}
+
+	backendServers := make(map[string]haproxy.Server, len(b.Servers))
+	for _, srv := range b.Servers {
+		backendServers[srv.Name] = srv
+	}
+
+	for _, inst := range running {
+		// Always derive the NAT host-forwarded port from the VM index.
+		// inst.Port should already be 8000+idx (set by CloneAndStart / syncWithVirtualBox),
+		// but after a state reload it can be 0 or stale. Re-computing from the index
+		// guarantees we always give HAProxy the correct host port to reach this VM.
+		idx, hasIdx := appVMIndex(inst.Name)
+		if !hasIdx {
+			// Non-standard VM name without a numeric index: we cannot determine the
+			// correct NAT port, so skip it rather than registering a wrong address.
+			a.logEvent(EventWarning, fmt.Sprintf("No se puede determinar el puerto NAT para VM '%s' (nombre sin índice numérico); omitiendo del backend", inst.Name))
+			continue
+		}
+		port := 8000 + idx // host-forwarded port: 127.0.0.1:800X -> VM:8000
+
+		desired := haproxy.Server{Name: inst.Name, IP: "10.0.2.2", Port: port, Weight: 1, Active: true}
+		existing, ok := backendServers[inst.Name]
+		if !ok {
+			if err := a.registerServerInBackend(desired); err != nil {
+				a.logEvent(EventWarning, fmt.Sprintf("No se pudo registrar %s en backend %s: %v", inst.Name, a.backendName, err))
+			}
+			continue
+		}
+
+		if existing.IP != desired.IP || existing.Port != desired.Port || existing.Weight != desired.Weight || !existing.Active {
+			if err := a.hap.UpdateServer(a.backendName, desired.Name, desired.IP, desired.Port, desired.Weight); err != nil {
+				a.logEvent(EventWarning, fmt.Sprintf("No se pudo sincronizar servidor %s en backend %s: %v", inst.Name, a.backendName, err))
+			}
+		}
+	}
+
+	for _, srv := range b.Servers {
+		if !strings.HasPrefix(srv.Name, "app-vm-") {
+			continue
+		}
+		if _, ok := runningByName[srv.Name]; ok {
+			continue
+		}
+		if err := a.hap.RemoveServer(a.backendName, srv.Name); err != nil {
+			a.logEvent(EventWarning, fmt.Sprintf("No se pudo remover servidor detenido %s de backend %s: %v", srv.Name, a.backendName, err))
+		}
+	}
+}
+
 func (a *AutoScaler) canScaleOutNow() bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -218,10 +338,118 @@ func (a *AutoScaler) canScaleInNow() bool {
 	return time.Since(a.lastScaleOut) >= scaleInCooldownAfterScaleOut
 }
 
+func maxCPUForRunning(running []vm.Instance, latest map[string]float64) float64 {
+	peak := 0.0
+	for _, inst := range running {
+		if v, ok := latest[inst.Name]; ok && v > peak {
+			peak = v
+		}
+	}
+	return peak
+}
+
 func (a *AutoScaler) markScaleOutSuccess() {
 	a.mu.Lock()
 	a.lastScaleOut = time.Now()
 	a.mu.Unlock()
+}
+
+// bootstrapDemoServer launches the HTTP demo server on a new VM via SSH.
+// This ensures that newly scaled VMs are ready to receive traffic immediately.
+func (a *AutoScaler) bootstrapDemoServer(vmName string, sshPort int) {
+	a.mu.Lock()
+	sshUser := a.sshUser
+	sshKeyPath := a.sshKeyPath
+	a.mu.Unlock()
+
+	if sshUser == "" || sshKeyPath == "" {
+		a.logEvent(EventWarning, fmt.Sprintf("Saltando bootstrap de servidor demo en %s: SSH no configurado", vmName))
+		return
+	}
+
+	// Create SSH client
+	client, err := sshutil.New("127.0.0.1", sshPort, sshUser, sshKeyPath)
+	if err != nil {
+		a.logEvent(EventWarning, fmt.Sprintf("No se pudo conectar a %s via SSH para bootstrap: %v", vmName, err))
+		return
+	}
+
+	// Bootstrap script: Python HTTP server with /health and /heavy endpoints.
+	// Avoid pkill -f here because the SSH command itself can match the pattern
+	// and terminate the remote shell with signal 15.
+	bootstrapCmd := fmt.Sprintf(`cat > /tmp/em_demo_server.py <<'PYEOF'
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+import hashlib
+import time
+
+VMTAG = '%s'
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        path = parsed.path
+        if path == '/health':
+            body = b'ok\n'
+        elif path == '/heavy':
+            params = parse_qs(parsed.query)
+            budget_ms = 1200
+            if 'ms' in params and params['ms']:
+                try:
+                    budget_ms = max(100, min(6000, int(params['ms'][0])))
+                except ValueError:
+                    budget_ms = 1200
+            deadline = time.perf_counter() + (budget_ms / 1000.0)
+            total = 0
+            while time.perf_counter() < deadline:
+                hashlib.pbkdf2_hmac('sha256', b'password', b'salt', 100000)
+                total += 1
+            body = f'served_by={VMTAG}\nload={total}\n'.encode()
+        else:
+            body = f'served_by={VMTAG}\n'.encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+ThreadingHTTPServer(('0.0.0.0', 8000), Handler).serve_forever()
+PYEOF
+
+nohup python3 -u /tmp/em_demo_server.py >/tmp/em_demo_server.log 2>&1 < /dev/null &
+for i in 1 2 3 4 5; do
+	if command -v curl >/dev/null 2>&1; then
+		if curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null 2>&1; then
+			echo "OK"
+			exit 0
+		fi
+	elif command -v wget >/dev/null 2>&1; then
+		if wget -qO- --timeout=3 http://127.0.0.1:8000/health >/dev/null 2>&1; then
+			echo "OK"
+			exit 0
+		fi
+	fi
+	sleep 1
+done
+if command -v curl >/dev/null 2>&1; then
+	curl -s --max-time 3 http://127.0.0.1:8000/health 2>/dev/null || true
+elif command -v wget >/dev/null 2>&1; then
+	wget -qO- --timeout=3 http://127.0.0.1:8000/health 2>/dev/null || true
+fi
+echo "FAILED"
+exit 1
+`, vmName)
+
+	out, err := client.Run(bootstrapCmd)
+	if err != nil || !strings.Contains(out, "OK") {
+		a.logEvent(EventWarning, fmt.Sprintf("Error levantando servidor demo en %s: %v (output: %s)", vmName, err, out))
+		return
+	}
+
+	a.logEvent(EventInfo, fmt.Sprintf("Servidor demo levantado exitosamente en %s", vmName))
 }
 
 func (a *AutoScaler) syncHAProxyIfNeeded() {
@@ -259,7 +487,19 @@ func (a *AutoScaler) scaleOut(cfg config.AutoScalerConfig) {
 				}
 				a.mu.Unlock()
 			}
-			srv := haproxy.Server{Name: inst.Name, IP: inst.IP, Port: 8000, Weight: 1, Active: true}
+
+			// Bootstrap FIRST, then register. If the Python server is not up
+			// when HAProxy adds the backend, the health-checks fail immediately
+			// and HAProxy marks the VM as DOWN — traffic never reaches it.
+			a.bootstrapDemoServer(inst.Name, inst.SSHPort)
+
+			port := inst.Port
+			if idx, ok := appVMIndex(inst.Name); ok {
+				port = 8000 + idx
+			} else if port <= 0 {
+				port = 8000
+			}
+			srv := haproxy.Server{Name: inst.Name, IP: "10.0.2.2", Port: port, Weight: 1, Active: true}
 			if err := a.registerServerInBackend(srv); err != nil {
 				a.logEvent(EventWarning, fmt.Sprintf("Error registrando en HAProxy: %v", err))
 				return
@@ -314,7 +554,16 @@ func (a *AutoScaler) scaleOut(cfg config.AutoScalerConfig) {
 	}
 	a.mu.Unlock()
 
-	srv := haproxy.Server{Name: name, IP: inst.IP, Port: 8000, Weight: 1, Active: true}
+	// Bootstrap FIRST, then register — same reasoning as the reuse branch above.
+	a.bootstrapDemoServer(name, inst.SSHPort)
+
+	port := inst.Port
+	if idx, ok := appVMIndex(name); ok {
+		port = 8000 + idx
+	} else if port <= 0 {
+		port = 8000
+	}
+	srv := haproxy.Server{Name: name, IP: "10.0.2.2", Port: port, Weight: 1, Active: true}
 	if err := a.registerServerInBackend(srv); err != nil {
 		a.logEvent(EventWarning, fmt.Sprintf("Error registrando en HAProxy: %v", err))
 		return

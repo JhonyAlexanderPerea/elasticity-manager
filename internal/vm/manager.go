@@ -220,12 +220,12 @@ func (m *Manager) CloneAndStart(newName, ip string, appForwardPort, sshPort int)
 
 cloned:
 
-	// 2. Clean inherited NAT rules from snapshot (best-effort)
-	m.vbox("modifyvm", newName, "--natpf1", "delete", "ssh-haproxy") //nolint
-	m.vbox("modifyvm", newName, "--natpf1", "delete", "SSH-servidor1") //nolint
-	m.vbox("modifyvm", newName, "--natpf1", "delete", "SSH-"+m.baseVM) //nolint
-	m.vbox("modifyvm", newName, "--natpf1", "delete", "APP-servidor1") //nolint
-	m.vbox("modifyvm", newName, "--natpf1", "delete", "APP-"+m.baseVM) //nolint
+	// 2. Clean ALL inherited NAT rules from snapshot.
+	// Best-effort static deletes are not enough because snapshots can carry
+	// arbitrary rule names; stale APP/SSH rules can silently hijack traffic.
+	if err := m.clearNATForwardingRules(newName); err != nil {
+		return nil, fmt.Errorf("clear inherited nat rules for %q: %w", newName, err)
+	}
 
 	// 3. NAT rule: host 127.0.0.1:<sshPort> → VM :22
 	natRule := fmt.Sprintf("SSH-%s,tcp,127.0.0.1,%d,,22", newName, sshPort)
@@ -267,6 +267,10 @@ cloned:
 	fmt.Printf("[vm] waiting for SSH on %s (port %d)…\n", newName, sshPort)
 	if err := m.waitForSSH(sshPort, 180*time.Second); err != nil {
 		return nil, err
+	}
+
+	if err := m.disableBootImageService(newName); err != nil {
+		fmt.Printf("[vm] warning disabling image service on %s: %v\n", newName, err)
 	}
 
 	m.mu.Lock()
@@ -325,6 +329,10 @@ func (m *Manager) StartExisting(name string) (*Instance, error) {
 		}
 		m.mu.Unlock()
 		return nil, err
+	}
+
+	if err := m.disableBootImageService(name); err != nil {
+		fmt.Printf("[vm] warning disabling image service on %s: %v\n", name, err)
 	}
 
 	m.mu.Lock()
@@ -419,6 +427,52 @@ func (m *Manager) queryStatus(name string) Status {
 	return StatusUnknown
 }
 
+func (m *Manager) clearNATForwardingRules(name string) error {
+	info, err := m.vbox("showvminfo", name, "--machinereadable")
+	if err != nil {
+		return err
+	}
+
+	ruleNames := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, line := range strings.Split(info, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "Forwarding(") {
+			continue
+		}
+		firstQuote := strings.IndexByte(line, '"')
+		if firstQuote < 0 {
+			continue
+		}
+		rest := line[firstQuote+1:]
+		secondQuote := strings.IndexByte(rest, '"')
+		if secondQuote < 0 {
+			continue
+		}
+		raw := rest[:secondQuote]
+		comma := strings.IndexByte(raw, ',')
+		if comma <= 0 {
+			continue
+		}
+		ruleName := strings.TrimSpace(raw[:comma])
+		if ruleName == "" || seen[ruleName] {
+			continue
+		}
+		seen[ruleName] = true
+		ruleNames = append(ruleNames, ruleName)
+	}
+
+	for _, ruleName := range ruleNames {
+		if _, err := m.vbox("modifyvm", name, "--natpf1", "delete", ruleName); err != nil {
+			// If a concurrent process already removed it, continue.
+			if !strings.Contains(strings.ToLower(err.Error()), "not found") {
+				return fmt.Errorf("delete natpf rule %q: %w", ruleName, err)
+			}
+		}
+	}
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // SSH helpers
 // ---------------------------------------------------------------------------
@@ -457,6 +511,17 @@ func (m *Manager) waitForSSH(port int, timeout time.Duration) error {
 	}
 	fmt.Printf("[vm] SSH timeout on port %d (VM may still be booting)\n", port)
 	return fmt.Errorf("ssh timeout on port %d", port)
+}
+
+func (m *Manager) disableBootImageService(name string) error {
+	cmd := strings.Join([]string{
+		"sudo systemctl stop servidorimagenes.service || true",
+		"sudo systemctl disable servidorimagenes.service || true",
+		"if [ -f /etc/systemd/system/servidorimagenes.service ]; then sudo mv /etc/systemd/system/servidorimagenes.service /etc/systemd/system/servidorimagenes.service.disabled || true; sudo systemctl daemon-reload || true; fi",
+		"sudo systemctl mask servidorimagenes.service || true",
+	}, "; ")
+	_, err := m.RunCommand(name, cmd)
+	return err
 }
 
 // ---------------------------------------------------------------------------

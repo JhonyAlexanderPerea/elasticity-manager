@@ -30,4 +30,16 @@ Write-Host "Iniciando Elastic LB Manager..." -ForegroundColor Cyan
 Write-Host "Panel web: http://localhost:8080" -ForegroundColor Green
 Write-Host "Ctrl+C para detener`n" -ForegroundColor Yellow
 
+$listener = Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($listener) {
+    $ownerId = $listener.OwningProcess
+    $ownerProcess = Get-Process -Id $ownerId -ErrorAction SilentlyContinue
+    if ($ownerProcess) {
+        Write-Host "Liberando puerto 8080 (PID $ownerId - $($ownerProcess.ProcessName))..." -ForegroundColor Yellow
+    } else {
+        Write-Host "Liberando puerto 8080 (PID $ownerId)..." -ForegroundColor Yellow
+    }
+    Stop-Process -Id $ownerId -Force -ErrorAction SilentlyContinue
+}
+
 & $exe

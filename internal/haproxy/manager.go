@@ -5,6 +5,7 @@ package haproxy
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"text/template"
@@ -111,6 +112,15 @@ func (m *Manager) ListBackends() []Backend {
 	for _, b := range m.backends {
 		out = append(out, *b)
 	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Name == "app-backend" && out[j].Name != "app-backend" {
+			return true
+		}
+		if out[j].Name == "app-backend" && out[i].Name != "app-backend" {
+			return false
+		}
+		return out[i].Name < out[j].Name
+	})
 	return out
 }
 
@@ -274,8 +284,8 @@ defaults
     option  httplog
     option  dontlognull
     timeout connect 5s
-    timeout client  50s
-    timeout server  50s
+    timeout client  60s
+    timeout server  60s
 
 frontend http_in
     bind *:80
@@ -284,7 +294,8 @@ frontend http_in
 backend {{ .Name }}
     balance {{ .Algorithm }}
     option httpchk GET /health
-    {{ range .Servers }}server {{ .Name }} {{ .IP }}:{{ .Port }} weight {{ .Weight }} check
+    http-check expect string ok
+    {{ range .Servers }}server {{ .Name }} {{ .IP }}:{{ .Port }} weight {{ .Weight }} check inter 3s rise 2 fall 3
     {{ end }}
 {{ end }}`
 
@@ -301,8 +312,17 @@ func (m *Manager) render() (string, error) {
 		backends = append(backends, *b)
 	}
 	m.mu.RUnlock()
+	sort.Slice(backends, func(i, j int) bool {
+		return backends[i].Name < backends[j].Name
+	})
 	def := "default_backend"
-	if len(backends) > 0 {
+	for _, b := range backends {
+		if b.Name == "app-backend" {
+			def = b.Name
+			break
+		}
+	}
+	if def == "default_backend" && len(backends) > 0 {
 		def = backends[0].Name
 	}
 	d := tmplData{

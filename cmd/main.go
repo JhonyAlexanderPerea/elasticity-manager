@@ -54,15 +54,17 @@ func main() {
 	defaultConfig := config.AutoScalerConfig{
 		UpperThreshold:   80.0,
 		LowerThreshold:   20.0,
+		PeakThreshold:    90.0,
 		SampleInterval:   10,
 		EvaluationWindow: 60,
 		MaxInstances:     5,
-		MinInstances:     1,
+		MinInstances:     2,
 	}
 	initialConfig := defaultConfig
 	if hasSavedState {
 		initialConfig = mergeConfig(defaultConfig, savedState.Config)
 	}
+	initialConfig = enforceBalancingPolicy(initialConfig)
 	store := config.NewStore(initialConfig, nil)
 
 	// ── SSH key path (Windows: %USERPROFILE%\.ssh\id_rsa) ───────────────────
@@ -136,6 +138,7 @@ func main() {
 	if len(initialEvents) > 0 || initialInstanceN > 0 {
 		scaler.SetState(initialEvents, initialInstanceN)
 	}
+	scaler.SetSSHConfig(sshUser, sshKeyPath)
 
 	var persistMu sync.Mutex
 	persistState := func() {
@@ -176,6 +179,7 @@ func main() {
 	vmMgr.StartBackgroundSync(ctx, 3*time.Second)
 	go cpuMon.Start(ctx)
 	go scaler.Start(ctx)
+	go scaler.EnsureMinInstances(store.GetConfig().MinInstances)
 
 	// ── Graceful shutdown ────────────────────────────────────────────────────
 	quit := make(chan os.Signal, 1)
@@ -281,6 +285,9 @@ func mergeConfig(base, override config.AutoScalerConfig) config.AutoScalerConfig
 	if override.LowerThreshold != 0 {
 		base.LowerThreshold = override.LowerThreshold
 	}
+	if override.PeakThreshold != 0 {
+		base.PeakThreshold = override.PeakThreshold
+	}
 	if override.SampleInterval != 0 {
 		base.SampleInterval = override.SampleInterval
 	}
@@ -294,6 +301,19 @@ func mergeConfig(base, override config.AutoScalerConfig) config.AutoScalerConfig
 		base.MinInstances = override.MinInstances
 	}
 	return base
+}
+
+func enforceBalancingPolicy(cfg config.AutoScalerConfig) config.AutoScalerConfig {
+	if cfg.MinInstances < 2 {
+		cfg.MinInstances = 2
+	}
+	if cfg.MaxInstances < 2 {
+		cfg.MaxInstances = 2
+	}
+	if cfg.MinInstances > cfg.MaxInstances {
+		cfg.MinInstances = cfg.MaxInstances
+	}
+	return cfg
 }
 
 func loadPersistedState(path string) (persistedState, bool) {
