@@ -521,8 +521,6 @@ func (h *handlers) streamEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-
-
 // ── HAProxy config ────────────────────────────────────────────────────────────
 func (h *handlers) haproxyConfig(w http.ResponseWriter, r *http.Request) {
 	cfg, err := h.hap.GetConfig()
@@ -892,5 +890,3 @@ func badRequest(w http.ResponseWriter, msg string) {
 func serverError(w http.ResponseWriter, msg string) {
 	respond(w, http.StatusInternalServerError, map[string]string{"error": msg})
 }
-
-
