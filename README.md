@@ -1,5 +1,4 @@
 # Elastic Load Balancer Manager
-**Examen Parcial #2 – Parte 3 | Universidad del Quindío 2026-1**
 
 ---
 
@@ -72,7 +71,7 @@ go mod tidy
 
 4. Inicia la VM e instala los paquetes necesarios:
    ```bash
-   sudo apt update && sudo apt install -y haproxy stress-ng openssh-server python3
+  sudo apt update && sudo apt install -y haproxy stress-ng openssh-server python3 wrk
    sudo systemctl enable haproxy ssh
    ```
 
@@ -212,6 +211,9 @@ POST /api/autoscaler/disable
 
 ```http
 POST /api/simulate
+POST /api/simulate/cancel
+POST /api/simulate/wrk
+POST /api/simulate/wrk/cancel
 ```
 ```json
 // Modo 1: Inyección directa (sin SSH, para demo)
@@ -229,7 +231,30 @@ POST /api/simulate
   "duration": 60,
   "use_ssh": true
 }
+
+// Modo 3: carga HTTP masiva con wrk vía la VM de HAProxy
+{
+  "threads": 4,
+  "connections": 100,
+  "duration": 30,
+  "path": "/"
+}
 ```
+
+### Prueba de balanceo masiva
+
+La pestaña **Simulación** del panel ahora incluye un bloque para `wrk` que ejecuta la carga desde la VM de HAProxy contra la ruta objetivo. También puedes usar el script de carga larga para mantener presión sobre el sistema por varios minutos.
+
+```powershell
+.
+scripts\test-balancing.ps1 -SshUser user -HaproxySshPort 2200 -MaxVMs 2 -Concurrency 25 -DurationSeconds 600
+```
+
+Parámetros útiles:
+- `-Requests`: total de requests cuando no usas modo por duración.
+- `-Concurrency`: cantidad de workers concurrentes.
+- `-DurationSeconds`: si es mayor que cero, mantiene la carga durante ese tiempo.
+- `-MaxVMs`: limita cuántas VMs estables toma para la prueba.
 
 ---
 
@@ -270,6 +295,24 @@ watch -n 1 "grep 'cpu ' /proc/stat | awk '{usage=(\$2+\$4)*100/(\$2+\$3+\$4+\$5)
 
 O usa la pestaña **Simulación** del panel web sin necesidad de SSH.
 
+## Pruebas con wrk
+
+`wrk` se usa para generar peticiones HTTP masivas contra HAProxy y verificar el balanceo real entre VMs.
+
+Ejemplo por consola:
+
+```bash
+wrk -t4 -c100 -d30s http://IP_HAPROXY/
+```
+
+Desde el panel web, usa la tarjeta **wrk vía HAProxy SSH** e ingresa:
+- `Threads (-t)`: cantidad de hilos de `wrk`
+- `Conexiones (-c)`: conexiones simultáneas
+- `Duración (seg)`: cuánto tiempo mantener la carga
+- `Ruta objetivo`: por ejemplo `/` o `/heavy` si tu backend la expone
+
+Si quieres cancelar la prueba en curso, usa el botón **Cancelar** de la misma tarjeta.
+
 ---
 
 ## Estructura del Proyecto
@@ -304,6 +347,7 @@ elasticity-manager/
 2. **Tiempo de arranque de VMs** (~30-60s) puede causar que HAProxy registre servidores no listos → se implementó espera de SSH con timeout.
 3. **VBoxManage path variable** en Windows → se implementó detección automática de la ruta de instalación.
 4. **Escritura remota de archivos** → se usa `echo '...' | sudo tee` para escribir `/etc/haproxy/haproxy.cfg` sin transferencia de archivos (no se requiere `scp`).
+5. **Pruebas de carga** → `stress-ng` estresa CPU y `wrk` estresa tráfico HTTP masivo desde la VM de HAProxy.
 
 ### Mejoras futuras
 - Persistencia de estado en SQLite (sobrevivir reinicios de la app)
