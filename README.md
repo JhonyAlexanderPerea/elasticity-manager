@@ -261,7 +261,7 @@ Parámetros útiles:
 ## Lógica de Auto-Scaling
 
 ```
-Cada 10 segundos el scaler evalúa:
+Cada 10 segundos el scaler evalúa (este valor puede cambiarse desde la interfaz):
 
   avg = promedio de CPU en los últimos `evaluation_window` segundos
 
@@ -340,19 +340,3 @@ elasticity-manager/
 
 ---
 
-## Problemas y Mejoras
-
-### Problemas encontrados
-1. **HAProxy no disponible en Windows nativamente** → se resuelve corriendo HAProxy en la VM y gestionándolo via SSH.
-2. **Tiempo de arranque de VMs** (~30-60s) puede causar que HAProxy registre servidores no listos → se implementó espera de SSH con timeout.
-3. **VBoxManage path variable** en Windows → se implementó detección automática de la ruta de instalación.
-4. **Escritura remota de archivos** → se usa `echo '...' | sudo tee` para escribir `/etc/haproxy/haproxy.cfg` sin transferencia de archivos (no se requiere `scp`).
-5. **Pruebas de carga** → `stress-ng` estresa CPU y `wrk` estresa tráfico HTTP masivo desde la VM de HAProxy.
-
-### Mejoras futuras
-- Persistencia de estado en SQLite (sobrevivir reinicios de la app)
-- Instalar como servicio Windows con `sc.exe` o NSSM
-- Soporte para múltiples backends con escalado independiente
-- Exportar métricas a Prometheus/Grafana
-- Autenticación JWT en el panel web
-- Notificaciones (email/Slack) en eventos de scale
